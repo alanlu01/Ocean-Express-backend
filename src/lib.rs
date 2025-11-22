@@ -1,15 +1,8 @@
-use axum::{Router, http::StatusCode, routing::get};
+use axum::Router;
 
-pub fn app() -> Router {
-    Router::new()
-        .route("/", get(root_handler))
-        .route("/getProduct", get(get_product))
-}
+// import and merge all route here
+mod routes;
 
-async fn root_handler() -> &'static str {
-    "Hello World!"
-}
-
-async fn get_product() -> (StatusCode, &'static str) {
-    (StatusCode::OK, "Product added successfully")
+pub fn app() -> Router{
+    Router::new().merge(routes::api_router())
 }
