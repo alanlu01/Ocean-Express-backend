@@ -3,7 +3,9 @@ use mongodb::{bson::doc, bson::Document, Database};
 use futures::stream::TryStreamExt;
 
 async fn get_all_shops(State(db): State<Database>) -> Result<Json<Vec<Document>>, (StatusCode, String)>{
-    let collections = db.list_collection_names().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("List collections error: {}", e)))?;
+    let collections = db.list_collection_names()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("List collections error: {}", e)))?;
     println!("collections in DB: {:?}", collections);
 
     if collections.is_empty() {
