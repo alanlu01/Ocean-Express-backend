@@ -1,5 +1,5 @@
 use axum::{Router, extract::{State, Path}, routing::get, Json};
-use mongodb::{bson::{doc, Document, oid::ObjectId}, Database};
+use mongodb::{bson::{doc, Document}, Database};
 use futures::stream::TryStreamExt;
 use axum::http::StatusCode;
 
@@ -7,12 +7,8 @@ async fn get_menu(Path(shop_id): Path<String>, State(db): State<Database>) -> Re
     // Query the `menu` collection
     let collection = db.collection::<Document>("menu");
 
-    // filter: match the shop_id as oid or string
-    let filter = if let Ok(oid) = ObjectId::parse_str(&shop_id) {
-        doc! {"shop_id": oid.clone()}
-    } else {
-        doc! {"shop_id": shop_id.clone()}
-    };
+    // filter: match the shop_id as a string
+    let filter = doc! { "shop_id": shop_id.clone() };
 
     println!("menu.get_menu - using filter: {:?}", filter);
 
