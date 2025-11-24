@@ -1,5 +1,5 @@
 use axum::{Router, http::StatusCode, routing::get, extract::{State, Path}, Json};
-use mongodb::{bson::{doc, Bson, Document, oid::ObjectId}, Database};
+use mongodb::{bson::{doc, Bson, Document}, Database};
 use futures::stream::TryStreamExt;
 
 // GET /restaurants
