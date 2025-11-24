@@ -16,13 +16,17 @@ async fn get_all_shops(State(db): State<Database>) -> Result<Json<Vec<Document>>
     let coll_name = if collections.iter().any(|c| c == "shops") {
         "shops"
     } else {
-        &collections[0]
+        // db : 0 cart, 1 menu, 2 shops
+        &collections[2]
     };
 
     // test print
     println!("using collection: {}", coll_name);
     let collection = db.collection::<Document>(coll_name);
-    let mut cursor = collection.find(doc! {}).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Find error: {}", e)))?;
+    let mut cursor = collection
+        .find(doc! {})
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("home_page error: {}", e)))?;
     let mut results = Vec::new();
     while let Some(doc) = cursor.try_next().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Cursor error: {}", e)))? {
         results.push(doc);
