@@ -32,3 +32,16 @@ pub fn menu_router(db: Database) -> Router{
         .route("/{shop_id}/menu", get(get_menu))
         .with_state(db)
 }
+
+
+// { 
+// "items": 
+// [ { 
+//     "name": "Burger", 
+//     "description": "...", 
+//     "price": 180, 
+//     "sizes": ["Regular", "Large"], 
+//     "spicinessOptions": ["Mild","Medium","Hot"], 
+//     "imageUrl": null
+//  } ] 
+// }
