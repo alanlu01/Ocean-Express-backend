@@ -23,7 +23,7 @@ fn now_rfc3339() -> String{
 }
 
 fn auth_from_headers(headers: &HeaderMap) -> Result<Claims, (StatusCode, Json<serde_json::Value>)>{
-    let auth = headers.get("authorization")
+    let auth = headers.get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !auth.to_lowercase().starts_with("bearer ") {
