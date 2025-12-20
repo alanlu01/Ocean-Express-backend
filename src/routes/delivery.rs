@@ -279,23 +279,43 @@ async fn report_incident(Path(id): Path<String>, State(db): State<Database>, hea
 }
 
 async fn list_locations(State(db): State<Database>) -> ApiResult{
-    // Public list; keep open
-    let collection = db.collection::<Document>("delivery_locations");
-    let mut cursor = collection.find(doc! {})
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    // Public list; keep open. Merge delivery_locations and NTOU_location.
     let mut grouped: std::collections::BTreeMap<String, Vec<Bson>> = std::collections::BTreeMap::new();
-    while let Some(doc) = cursor.try_next()
-        .await
-        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
-        let category = get_string(&doc, "category").unwrap_or_else(|| "default".to_string());
-        let item = doc! {
-            "name": get_string(&doc, "name").unwrap_or_default(),
-            "lat": doc.get_f64("lat").ok(),
-            "lng": doc.get_f64("lng").ok()
-        };
-        grouped.entry(category).or_default().push(Bson::Document(item));
+
+    // delivery_locations
+    let collection = db.collection::<Document>("delivery_locations");
+    if let Ok(mut cursor) = collection.find(doc! {}).await {
+        while let Some(doc) = cursor.try_next()
+            .await
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
+            let category = get_string(&doc, "category").unwrap_or_else(|| "default".to_string());
+            let item = doc! {
+                "name": get_string(&doc, "name").unwrap_or_default(),
+                "lat": doc.get_f64("lat").ok(),
+                "lng": doc.get_f64("lng").ok()
+            };
+            grouped.entry(category).or_default().push(Bson::Document(item));
+        }
     }
+
+    // NTOU_location
+    let ntou = db.collection::<Document>("NTOU_location");
+    if let Ok(mut cursor) = ntou.find(doc! {}).await {
+        while let Some(doc) = cursor.try_next()
+            .await
+            .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
+            let location = doc.get_document("location").ok();
+            let lat = location.and_then(|d| d.get_f64("lat").ok());
+            let lng = location.and_then(|d| d.get_f64("lng").ok());
+            let item = doc! {
+                "name": get_string(&doc, "name").unwrap_or_default(),
+                "lat": lat,
+                "lng": lng
+            };
+            grouped.entry("default".to_string()).or_default().push(Bson::Document(item));
+        }
+    }
+
     let locations: Vec<Bson> = grouped.into_iter().map(|(category, items)| {
         Bson::Document(doc! { "category": category, "items": items })
     }).collect();
