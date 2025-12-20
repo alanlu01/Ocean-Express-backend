@@ -1,129 +1,96 @@
-
-use axum::{Router, routing::post, extract::State, Json, http::StatusCode, response::IntoResponse};
-use mongodb::{bson::{doc, Document, Bson, oid::ObjectId}, Database};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use axum::{Router, extract::State, routing::post, Json};
+use axum::http::StatusCode;
 use bcrypt::{hash, verify, DEFAULT_COST};
-use jsonwebtoken::{EncodingKey, Header};
-use std::env;
+use mongodb::{bson::{doc, Bson, Document}, Database};
+use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+use crate::routes::common::{ApiResult, data_response, data_response_with_status, document_id, error_response};
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    name: String,
+    email: String,
+    password: String,
+    phone: String,
+}
+
+#[derive(Deserialize)]
 struct LoginRequest {
     email: String,
     password: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RegisterRequest {
-    name: String,
-    email: String,
-    password: String,
-}
+async fn register(State(db): State<Database>, Json(payload): Json<RegisterRequest>) -> ApiResult{
+    let collection = db.collection::<Document>("users");
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    email: String,
-    role: String,
-    exp: usize,
-}
-
-fn make_jwt(user_id: &str, email: &str, role: &str) -> Result<String, jsonwebtoken::errors::Error> {
-    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "secret-key-change-me".to_string());
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
-    // expire in 24 hours
-    let exp = now + 60 * 60 * 24;
-    let claims = Claims { sub: user_id.to_string(), email: email.to_string(), role: role.to_string(), exp };
-    jsonwebtoken::encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))
-}
-
-async fn login_handler(State(db): State<Database>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
-    let users = db.collection::<Document>("users");
-
-    let filter = doc! { "email": &body.email };
-    let found = users.find_one(filter).await;
-    match found {
-        Ok(Some(doc)) => {
-            // get stored password
-            let stored = 
-                doc.get("password")
-                .and_then(Bson::as_str)
-                .map(|s| s.to_string());
-            if let Some(stored_hash) = stored {
-                if verify(&body.password, &stored_hash).unwrap_or(false) {
-                    let user_id = 
-                        doc.get("id")
-                        .and_then(Bson::as_str).map(|s| s.to_string());
-
-                    let user_id = user_id.unwrap();
-                    let role = 
-                        doc.get("role")
-                        .and_then(Bson::as_str)
-                        .map(|s| s.to_string()).unwrap();
-
-                    match make_jwt(&user_id, &body.email, &role) {
-                        Ok(token) => {
-                            let resp = json!({ "data": { "token": token, "user": { "id": user_id, "email": body.email, "role": role } } });
-                            return (StatusCode::OK, Json(resp)).into_response();
-                        }
-                        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": "token error", "detail": e.to_string() }))).into_response(),
-                    }
-                }
-            }
-
-            (StatusCode::UNAUTHORIZED, Json(json!({ "message": "invalid credentials", "code": "auth.invalid" }))).into_response()
-        }
-        Ok(None) => (StatusCode::UNAUTHORIZED, Json(json!({ "message": "invalid credentials", "code": "auth.invalid" }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": e.to_string() }))).into_response(),
-    }
-}
-
-async fn register_handler(State(db): State<Database>, Json(body): Json<RegisterRequest>) -> impl IntoResponse {
-    let users = db.collection::<Document>("users");
-
-    // check if email exists
-    let filter = doc! { "email": &body.email };
-    match users.find_one(filter).await {
-        Ok(Some(_)) => return (StatusCode::BAD_REQUEST, Json(json!({ "message": "email exists", "code": "auth.email_taken" }))).into_response(),
-        Ok(None) => {}
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": e.to_string() }))).into_response(),
+    let existing = collection.find_one(doc! { "email": &payload.email })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    if existing.is_some() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "auth.email_taken", "email exists"));
     }
 
-    // hash password
-    let hashed = match hash(&body.password, DEFAULT_COST) {
-        Ok(h) => h,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": e.to_string() }))).into_response(),
+    let password_hash = hash(&payload.password, DEFAULT_COST)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+
+    let user_doc = doc! {
+        "name": &payload.name,
+        "email": &payload.email,
+        "password": password_hash,
+        "phone": &payload.phone,
+        "role": "customer"
     };
 
-    // create user id from ObjectId
-    let oid = ObjectId::new();
-    let user_id = oid.to_hex();
+    let insert = collection.insert_one(user_doc)
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
 
-    let new_user = doc! {
-        "id": user_id.clone(),
-        "name": &body.name,
-        "email": &body.email,
-        "password": hashed,
+    let id = insert.inserted_id.as_object_id().map(|oid| oid.to_hex());
+
+    let data = doc! {
+        "id": id.unwrap_or_default(),
+        "email": payload.email,
         "role": "customer",
+        "phone": payload.phone
     };
 
-    if let Err(e) = users.insert_one(new_user).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": e.to_string() }))).into_response();
+    Ok(data_response_with_status(StatusCode::CREATED, Bson::Document(data)))
+}
+
+async fn login(State(db): State<Database>, Json(payload): Json<LoginRequest>) -> ApiResult{
+    let collection = db.collection::<Document>("users");
+    let user = collection.find_one(doc! { "email": &payload.email })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+
+    let Some(user_doc) = user else {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "auth.invalid", "invalid credentials"));
+    };
+
+    let stored = user_doc.get_str("password").unwrap_or("");
+
+    // accept both hashed (preferred) and legacy plaintext for backward compatibility
+    let password_ok = verify(&payload.password, stored).unwrap_or(false) || stored == payload.password;
+    if !password_ok {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "auth.invalid", "invalid credentials"));
     }
 
-    // create token
-    match make_jwt(&user_id, &body.email, "customer") {
-        Ok(token) => {
-            let resp = json!({ "data": { "token": token, "user": { "id": user_id, "email": body.email, "role": "customer" } } });
-            (StatusCode::CREATED, Json(resp)).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "message": "token error", "detail": e.to_string() }))).into_response(),
-    }
+    let token = mongodb::bson::oid::ObjectId::new().to_hex();
+    let user_id = document_id(&user_doc).unwrap_or_default();
+    let user_data = doc! {
+        "id": user_id,
+        "email": payload.email,
+        "role": user_doc.get_str("role").unwrap_or("customer"),
+        "phone": user_doc.get_str("phone").unwrap_or("")
+    };
+
+    let data = doc! { "token": token, "user": Bson::Document(user_data) };
+    Ok(data_response(Bson::Document(data)))
 }
 
 pub fn auth_router(db: Database) -> Router{
     Router::new()
-        .route("/login", post(login_handler))
-        .route("/register", post(register_handler))
+        .route("/register", post(register))
+        .route("/login", post(login))
         .with_state(db)
 }
