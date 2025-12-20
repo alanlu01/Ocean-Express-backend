@@ -75,6 +75,19 @@ async fn load_customer(db: &Database, user_id: &str) -> Option<Document>{
     }
 }
 
+async fn load_rider_info(db: &Database, order_doc: &Document) -> Option<(String, String)>{
+    let deliverer_id = get_string(order_doc, "delivererId")?;
+    let users = db.collection::<Document>("users");
+    if let Ok(Some(user_doc)) = users.find_one(doc! { "id": &deliverer_id }).await {
+        let name = get_string(&user_doc, "name").unwrap_or_default();
+        let phone = get_string(&user_doc, "phone").unwrap_or_default();
+        if !name.is_empty() || !phone.is_empty() {
+            return Some((name, phone));
+        }
+    }
+    None
+}
+
 async fn find_menu_item(db: &Database, menu_item_id: &str) -> Result<Option<Document>, (StatusCode, Json<Document>)>{
     let collection = db.collection::<Document>("menu");
     let filter = doc! {
@@ -282,8 +295,16 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>, headers: 
     data.insert("totalAmount", get_i64(&order_doc, "totalAmount").unwrap_or(0));
     data.insert("status", get_string(&order_doc, "status").unwrap_or_default());
     data.insert("etaMinutes", get_i64(&order_doc, "etaMinutes").unwrap_or(0));
-    data.insert("riderName", get_string(&order_doc, "riderName").unwrap_or_default());
-    data.insert("riderPhone", get_string(&order_doc, "riderPhone").unwrap_or_default());
+    let mut rider_name = get_string(&order_doc, "riderName").unwrap_or_default();
+    let mut rider_phone = get_string(&order_doc, "riderPhone").unwrap_or_default();
+    if rider_name.is_empty() || rider_phone.is_empty() {
+        if let Some((name, phone)) = load_rider_info(&db, &order_doc).await {
+            if rider_name.is_empty() { rider_name = name; }
+            if rider_phone.is_empty() { rider_phone = phone; }
+        }
+    }
+    data.insert("riderName", rider_name);
+    data.insert("riderPhone", rider_phone);
     if let Some(placed_at) = order_doc.get("placedAt").and_then(iso_from_bson) {
         data.insert("placedAt", placed_at);
     }
