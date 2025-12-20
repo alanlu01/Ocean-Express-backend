@@ -1,12 +1,13 @@
 #![allow(non_snake_case)]
 
 use tokio::net::TcpListener;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, interval};
 use mongodb::{options::{ClientOptions, ServerApi, ServerApiVersion}, Client, Database, bson::{doc, DateTime}};
 use std::env;
 use axum::Router;
 use dotenv::dotenv;
 use chrono::Utc;
+use reqwest::Client as HttpClient;
 
 // import the app constructor from lib,
 // don't use "mod lib", the compiler will find through src/lib/routes
@@ -54,6 +55,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
             sleep(Duration::from_secs(60)).await;
         }
     });
+
+    // self-ping to keep Render awake (optional: set SELF_PING_URL)
+    if let Ok(self_url) = env::var("SELF_PING_URL") {
+        tokio::spawn(async move {
+            let client = HttpClient::new();
+            let mut ticker = interval(Duration::from_secs(14 * 60));
+            // first tick immediately
+            loop {
+                ticker.tick().await;
+                match client.get(&self_url).send().await {
+                    Ok(resp) => println!("self-ping ok {} {}", resp.status(), self_url),
+                    Err(e) => eprintln!("self-ping failed: {}", e),
+                }
+            }
+        });
+    }
 
     // Start server
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
