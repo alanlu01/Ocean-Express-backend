@@ -8,6 +8,7 @@ mod menu;
 mod orders;
 mod restaurant;
 mod retaurants;
+mod push;
 
 pub fn api_router(db: Database) -> Router{
     // merge all routes(an api is an endpoint) here
@@ -18,4 +19,5 @@ pub fn api_router(db: Database) -> Router{
     .nest("/orders", orders::orders_router(db.clone()))
     .nest("/delivery", delivery::delivery_router(db.clone()))
     .nest("/restaurant", restaurant::restaurant_router(db.clone()))
+    .nest("/push", push::push_router(db.clone()))
 }

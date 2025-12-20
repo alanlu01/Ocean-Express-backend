@@ -3,12 +3,14 @@ use mongodb::{bson::{doc, Bson, Document}, Database};
 use serde::Deserialize;
 use futures::stream::TryStreamExt;
 use axum::http::StatusCode;
-use crate::routes::common::{ApiResult, data_response, error_response, document_id, get_i64, now_datetime, get_string, bearer_token, date_range_to_bson, iso_from_bson};
+use crate::routes::common::{ApiResult, data_response, error_response, document_id, get_i64, now_datetime, get_string, date_range_to_bson, iso_from_bson, require_role};
 
 #[derive(Deserialize)]
 struct AcceptRequest {
-    riderName: Option<String>,
-    riderPhone: Option<String>,
+    #[serde(rename = "riderName")]
+    rider_name: Option<String>,
+    #[serde(rename = "riderPhone")]
+    rider_phone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -23,10 +25,8 @@ struct IncidentRequest {
 
 #[derive(Deserialize)]
 struct LocationRequest {
-    name: Option<String>,
     lat: Option<f64>,
     lng: Option<f64>,
-    category: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,8 +43,22 @@ struct EarningsQuery {
 
 #[derive(Deserialize)]
 struct NotificationsQuery {
-    sinceId: Option<String>,
+    #[serde(rename = "sinceId")]
+    since_id: Option<String>,
     since: Option<String>,
+}
+
+fn can_transition(current: &str, next: &str) -> bool{
+    match (current, next) {
+        ("available", "assigned") => true,
+        ("assigned", "en_route_to_pickup") => true,
+        ("en_route_to_pickup", "picked_up") => true,
+        ("picked_up", "delivering") => true,
+        ("delivering", "delivered") => true,
+        // cancellations allowed before delivered
+        (_, "cancelled") if current != "delivered" && current != "cancelled" => true,
+        _ => false,
+    }
 }
 
 fn map_delivery(order: &Document) -> Document{
@@ -79,9 +93,7 @@ fn map_delivery(order: &Document) -> Document{
 }
 
 async fn list_available(State(db): State<Database>, headers: HeaderMap) -> ApiResult{
-    if bearer_token(&headers).is_none() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let _claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let filter = doc! { "status": "available" };
     let mut cursor = collection.find(filter)
@@ -99,6 +111,7 @@ async fn list_available(State(db): State<Database>, headers: HeaderMap) -> ApiRe
 }
 
 async fn get_delivery(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let order = collection.find_one(doc! { "id": &id })
         .await
@@ -107,8 +120,7 @@ async fn get_delivery(Path(id): Path<String>, State(db): State<Database>, header
         return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
     };
     if get_string(&order_doc, "status").as_deref() != Some("available") {
-        let deliverer_id = bearer_token(&headers).unwrap_or_default();
-        if deliverer_id.is_empty() || get_string(&order_doc, "delivererId").as_deref() != Some(&deliverer_id) {
+        if get_string(&order_doc, "delivererId").as_deref() != Some(&claims.sub) {
             return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
         }
     }
@@ -117,10 +129,7 @@ async fn get_delivery(Path(id): Path<String>, State(db): State<Database>, header
 }
 
 async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<AcceptRequest>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let order = collection.find_one(doc! { "id": &id })
         .await
@@ -135,9 +144,9 @@ async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, hea
     let update = doc! {
         "$set": {
             "status": "assigned",
-            "delivererId": &deliverer_id,
-            "riderName": payload.riderName.unwrap_or_default(),
-            "riderPhone": payload.riderPhone.unwrap_or_default()
+            "delivererId": &claims.sub,
+            "riderName": payload.rider_name.unwrap_or_default(),
+            "riderPhone": payload.rider_phone.unwrap_or_default()
         },
         "$push": { "statusHistory": { "status": "assigned", "timestamp": now } }
     };
@@ -155,13 +164,10 @@ async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, hea
 }
 
 async fn list_active(State(db): State<Database>, headers: HeaderMap) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let filter = doc! {
-        "delivererId": deliverer_id,
+        "delivererId": &claims.sub,
         "status": { "$in": ["assigned", "en_route_to_pickup", "picked_up", "delivering"] }
     };
     let mut cursor = collection.find(filter)
@@ -177,13 +183,10 @@ async fn list_active(State(db): State<Database>, headers: HeaderMap) -> ApiResul
 }
 
 async fn list_history(State(db): State<Database>, headers: HeaderMap, Query(query): Query<HistoryQuery>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let mut filter = doc! {
-        "delivererId": deliverer_id,
+        "delivererId": &claims.sub,
         "status": { "$in": ["delivered", "cancelled"] }
     };
     if let Some((start, end)) = date_range_to_bson(query.from.as_deref(), query.to.as_deref()) {
@@ -202,10 +205,7 @@ async fn list_history(State(db): State<Database>, headers: HeaderMap, Query(quer
 }
 
 async fn update_status(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<StatusUpdateRequest>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
     let order = collection.find_one(doc! { "id": &id })
         .await
@@ -213,8 +213,12 @@ async fn update_status(Path(id): Path<String>, State(db): State<Database>, heade
     let Some(order_doc) = order else {
         return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
     };
-    if get_string(&order_doc, "delivererId").as_deref() != Some(&deliverer_id) {
+    if get_string(&order_doc, "delivererId").as_deref() != Some(&claims.sub) {
         return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
+    let current = get_string(&order_doc, "status").unwrap_or_default();
+    if !can_transition(&current, &payload.status) {
+        return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "invalid status transition"));
     }
     let now = now_datetime();
     let update = doc! {
@@ -235,15 +239,12 @@ async fn update_status(Path(id): Path<String>, State(db): State<Database>, heade
 }
 
 async fn report_incident(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<IncidentRequest>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("delivery_incidents");
     let now = now_datetime();
     let incident_doc = doc! {
         "orderId": &id,
-        "delivererId": deliverer_id,
+        "delivererId": &claims.sub,
         "note": payload.note,
         "createdAt": now
     };
@@ -254,6 +255,7 @@ async fn report_incident(Path(id): Path<String>, State(db): State<Database>, hea
 }
 
 async fn list_locations(State(db): State<Database>) -> ApiResult{
+    // Public list; keep open
     let collection = db.collection::<Document>("delivery_locations");
     let mut cursor = collection.find(doc! {})
         .await
@@ -276,38 +278,39 @@ async fn list_locations(State(db): State<Database>) -> ApiResult{
     Ok(data_response(Bson::Array(locations)))
 }
 
-async fn update_location(Path(_id): Path<String>, State(db): State<Database>, Json(payload): Json<LocationRequest>) -> ApiResult{
-    let collection = db.collection::<Document>("delivery_locations");
-    let mut location = Document::new();
-    if let Some(name) = payload.name {
-        location.insert("name", name);
+async fn update_location(Path(_id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<LocationRequest>) -> ApiResult{
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
+    let orders = db.collection::<Document>("orders");
+    let order = orders.find_one(doc! { "id": &_id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(order_doc) = order else {
+        return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
+    };
+    if let Some(deliverer) = get_string(&order_doc, "delivererId") {
+        if !deliverer.is_empty() && deliverer != claims.sub {
+            return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+        }
     }
-    if let Some(lat) = payload.lat {
-        location.insert("lat", lat);
-    }
-    if let Some(lng) = payload.lng {
-        location.insert("lng", lng);
-    }
-    if let Some(category) = payload.category {
-        location.insert("category", category);
-    }
-    collection.insert_one(location)
+    let lat = payload.lat.ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "validation.failed", "lat required"))?;
+    let lng = payload.lng.ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "validation.failed", "lng required"))?;
+    let update = doc! {
+        "$set": { "courierLocation": { "lat": lat, "lng": lng, "updatedAt": now_datetime() } }
+    };
+    orders.update_one(doc! { "id": &_id }, update)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
     Ok(data_response(Bson::Document(doc! { "ok": true })))
 }
 
 async fn list_earnings(State(db): State<Database>, headers: HeaderMap, Query(query): Query<EarningsQuery>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let Some((start, end)) = date_range_to_bson(Some(&query.from), Some(&query.to)) else {
         return Err(error_response(StatusCode::BAD_REQUEST, "validation.failed", "invalid date range"));
     };
     let collection = db.collection::<Document>("orders");
     let filter = doc! {
-        "delivererId": deliverer_id,
+        "delivererId": &claims.sub,
         "status": "delivered",
         "placedAt": { "$gte": start, "$lte": end }
     };
@@ -345,13 +348,10 @@ async fn list_earnings(State(db): State<Database>, headers: HeaderMap, Query(que
 }
 
 async fn list_notifications(State(db): State<Database>, headers: HeaderMap, Query(query): Query<NotificationsQuery>) -> ApiResult{
-    let deliverer_id = bearer_token(&headers).unwrap_or_default();
-    if deliverer_id.is_empty() {
-        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-    }
+    let claims = require_role(&headers, &["deliverer"])?;
     let collection = db.collection::<Document>("delivery_notifications");
-    let mut filter = doc! { "delivererId": deliverer_id };
-    if let Some(since_id) = query.sinceId {
+    let mut filter = doc! { "delivererId": &claims.sub };
+    if let Some(since_id) = query.since_id {
         filter.insert("id", doc! { "$gt": since_id });
     }
     if let Some(since) = query.since {

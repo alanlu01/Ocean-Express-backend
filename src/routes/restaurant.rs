@@ -1,10 +1,12 @@
-use axum::{Router, routing::{get, patch}, extract::{State, Path, Query}, Json};
+#![allow(non_snake_case)]
+
+use axum::{Router, routing::{get, patch}, extract::{State, Path, Query}, Json, http::HeaderMap};
 use mongodb::{bson::{doc, Bson, Document}, Database};
 use serde::Deserialize;
 use futures::stream::TryStreamExt;
 use axum::http::StatusCode;
 use std::collections::HashMap;
-use crate::routes::common::{ApiResult, data_response, data_response_with_status, error_response, document_id, get_string, get_i64, get_bool, get_array, now_datetime, iso_from_bson, now_millis};
+use crate::routes::common::{ApiResult, data_response, data_response_with_status, error_response, document_id, get_string, get_i64, get_bool, get_array, now_datetime, iso_from_bson, now_millis, require_role};
 
 #[derive(Deserialize)]
 struct OrderListQuery {
@@ -57,14 +59,54 @@ struct ReportQuery {
     restaurantId: Option<String>,
 }
 
+async fn load_customer(db: &Database, user_id: &str) -> Option<Document>{
+    let users = db.collection::<Document>("users");
+    match users.find_one(doc! { "id": user_id }).await {
+        Ok(Some(user_doc)) => {
+            let mut c = Document::new();
+            if let Some(name) = get_string(&user_doc, "name") {
+                c.insert("name", name);
+            }
+            if let Some(phone) = get_string(&user_doc, "phone") {
+                c.insert("phone", phone);
+            }
+            if let Some(email) = get_string(&user_doc, "email") {
+                c.insert("email", email);
+            }
+            c.insert("id", user_id.to_string());
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+fn can_transition(current: &str, next: &str) -> bool{
+    match (current, next) {
+        ("available", "assigned") => true,
+        ("assigned", "en_route_to_pickup") => true,
+        ("en_route_to_pickup", "picked_up") => true,
+        ("picked_up", "delivering") => true,
+        ("delivering", "delivered") => true,
+        (_, "cancelled") if current != "delivered" && current != "cancelled" => true,
+        _ => false,
+    }
+}
+
 fn map_menu_item(doc: &Document) -> Document{
     let mut item = Document::new();
     let id = document_id(doc);
     item.insert("id", id.unwrap_or_default());
     item.insert("name", get_string(doc, "name").unwrap_or_default());
     item.insert("description", get_string(doc, "description").unwrap_or_default());
-    item.insert("price", get_i64(doc, "price").unwrap_or(0));
-    if let Some(sizes) = get_array(doc, "sizes") {
+    let price = match doc.get("price") {
+        Some(Bson::Int32(v)) => *v as i64,
+        Some(Bson::Int64(v)) => *v,
+        Some(Bson::Double(v)) => v.round() as i64,
+        Some(Bson::String(s)) => s.parse::<i64>().unwrap_or(0),
+        _ => get_i64(doc, "price").unwrap_or(0),
+    };
+    item.insert("price", price);
+    if let Some(sizes) = get_array(doc, "sizes").or_else(|| get_array(doc, "size")) {
         item.insert("sizes", Bson::Array(sizes));
     }
     if let Some(spiciness) = get_array(doc, "spicinessOptions") {
@@ -78,11 +120,11 @@ fn map_menu_item(doc: &Document) -> Document{
     item
 }
 
-async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQuery>) -> ApiResult{
+async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQuery>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let mut filter = Document::new();
-    if let Some(restaurant_id) = query.restaurantId {
-        filter.insert("restaurantId", restaurant_id);
-    }
+    let restaurant_id = query.restaurantId.unwrap_or_else(|| claims.sub.clone());
+    filter.insert("restaurantId", restaurant_id);
 
     if let Some(status) = query.status {
         let statuses = match status.as_str() {
@@ -123,6 +165,12 @@ async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQu
 
         if let Some(customer) = doc.get("customer") {
             order.insert("customer", customer.clone());
+        } else if let Some(user_id) = get_string(&doc, "userId") {
+            if let Some(c) = load_customer(&db, &user_id).await {
+                order.insert("customer", c);
+            } else {
+                order.insert("customer", doc! { "name": Bson::Null, "phone": Bson::Null });
+            }
         } else {
             order.insert("customer", doc! { "name": Bson::Null, "phone": Bson::Null });
         }
@@ -150,7 +198,8 @@ async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQu
     Ok(data_response(Bson::Array(orders)))
 }
 
-async fn get_order(Path(id): Path<String>, State(db): State<Database>) -> ApiResult{
+async fn get_order(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let collection = db.collection::<Document>("orders");
     let order = collection.find_one(doc! { "id": &id })
         .await
@@ -158,6 +207,11 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>) -> ApiRes
     let Some(order_doc) = order else {
         return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
     };
+    if let Some(rest_id) = get_string(&order_doc, "restaurantId") {
+        if rest_id != claims.sub && Some(rest_id.clone()) != get_string(&order_doc, "shop_id") {
+            return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+        }
+    }
 
     let mut data = Document::new();
     data.insert("id", document_id(&order_doc).unwrap_or_default());
@@ -175,6 +229,12 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>) -> ApiRes
     }
     if let Some(customer) = order_doc.get("customer") {
         data.insert("customer", customer.clone());
+    } else if let Some(uid) = get_string(&order_doc, "userId") {
+        if let Some(c) = load_customer(&db, &uid).await {
+            data.insert("customer", c);
+        } else {
+            data.insert("customer", doc! { "name": Bson::Null, "phone": Bson::Null });
+        }
     } else {
         data.insert("customer", doc! { "name": Bson::Null, "phone": Bson::Null });
     }
@@ -215,8 +275,26 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>) -> ApiRes
     Ok(data_response(Bson::Document(data)))
 }
 
-async fn update_order_status(Path(id): Path<String>, State(db): State<Database>, Json(payload): Json<StatusUpdateRequest>) -> ApiResult{
+async fn update_order_status(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<StatusUpdateRequest>) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let collection = db.collection::<Document>("orders");
+    let existing = collection.find_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(order_doc) = existing else {
+        return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
+    };
+    let rest_id = get_string(&order_doc, "restaurantId").unwrap_or_default();
+    if !rest_id.is_empty() && rest_id != claims.sub {
+        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
+    let current = get_string(&order_doc, "status").unwrap_or_default();
+    if current == "delivered" || current == "cancelled" {
+        return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "order finalized"));
+    }
+    if !can_transition(&current, &payload.status) {
+        return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "invalid status transition"));
+    }
     let now = now_datetime();
     let update = doc! {
         "$set": { "status": &payload.status },
@@ -233,13 +311,11 @@ async fn update_order_status(Path(id): Path<String>, State(db): State<Database>,
     Ok(data_response(Bson::Document(doc! { "status": payload.status })))
 }
 
-async fn list_menu(State(db): State<Database>, Query(query): Query<MenuListQuery>) -> ApiResult{
+async fn list_menu(State(db): State<Database>, Query(query): Query<MenuListQuery>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let collection = db.collection::<Document>("menu");
-    let filter = if let Some(restaurant_id) = query.restaurantId {
-        doc! { "$or": [ { "shop_id": &restaurant_id }, { "restaurantId": &restaurant_id }, { "restaurant_id": &restaurant_id } ] }
-    } else {
-        doc! {}
-    };
+    let restaurant_id = query.restaurantId.unwrap_or_else(|| claims.sub.clone());
+    let filter = doc! { "$or": [ { "shop_id": &restaurant_id }, { "restaurantId": &restaurant_id }, { "restaurant_id": &restaurant_id } ] };
 
     let mut cursor = collection.find(filter)
         .await
@@ -254,7 +330,9 @@ async fn list_menu(State(db): State<Database>, Query(query): Query<MenuListQuery
     Ok(data_response(Bson::Array(items)))
 }
 
-async fn create_menu_item(State(db): State<Database>, Json(payload): Json<MenuItemRequest>) -> ApiResult{
+async fn create_menu_item(State(db): State<Database>, headers: HeaderMap, Json(payload): Json<MenuItemRequest>) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
+    let restaurant_id = payload.restaurantId.clone().unwrap_or_else(|| claims.sub.clone());
     let collection = db.collection::<Document>("menu");
     let id = mongodb::bson::oid::ObjectId::new().to_hex();
 
@@ -270,7 +348,7 @@ async fn create_menu_item(State(db): State<Database>, Json(payload): Json<MenuIt
         "sortOrder": payload.sortOrder,
         "allergens": payload.allergens.clone(),
         "tags": payload.tags.clone(),
-        "restaurantId": payload.restaurantId.clone().unwrap_or_default()
+        "restaurantId": restaurant_id
     };
 
     collection.insert_one(menu_doc.clone())
@@ -280,7 +358,8 @@ async fn create_menu_item(State(db): State<Database>, Json(payload): Json<MenuIt
     Ok(data_response_with_status(StatusCode::CREATED, Bson::Document(map_menu_item(&menu_doc))))
 }
 
-async fn update_menu_item(Path(id): Path<String>, State(db): State<Database>, Json(payload): Json<MenuItemPatch>) -> ApiResult{
+async fn update_menu_item(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<MenuItemPatch>) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let mut update_doc = Document::new();
     if let Some(name) = payload.name {
         update_doc.insert("name", name);
@@ -318,6 +397,18 @@ async fn update_menu_item(Path(id): Path<String>, State(db): State<Database>, Js
     }
 
     let collection = db.collection::<Document>("menu");
+    let existing = collection.find_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(menu_doc) = existing else {
+        return Err(error_response(StatusCode::NOT_FOUND, "menu.unavailable", "Menu item not found"));
+    };
+    if let Some(rest_id) = get_string(&menu_doc, "restaurantId").or_else(|| get_string(&menu_doc, "shop_id")) {
+        if rest_id != claims.sub {
+            return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+        }
+    }
+
     let update = doc! { "$set": update_doc };
     let result = collection.update_one(doc! { "id": &id }, update)
         .await
@@ -333,7 +424,31 @@ async fn update_menu_item(Path(id): Path<String>, State(db): State<Database>, Js
     Ok(data_response(Bson::Document(map_menu_item(&updated))))
 }
 
-async fn reports(State(db): State<Database>, Query(query): Query<ReportQuery>) -> ApiResult{
+async fn delete_menu_item(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
+    let collection = db.collection::<Document>("menu");
+    let existing = collection.find_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(menu_doc) = existing else {
+        return Err(error_response(StatusCode::NOT_FOUND, "menu.unavailable", "Menu item not found"));
+    };
+    if let Some(rest_id) = get_string(&menu_doc, "restaurantId").or_else(|| get_string(&menu_doc, "shop_id")) {
+        if rest_id != claims.sub {
+            return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+        }
+    }
+    let result = collection.delete_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    if result.deleted_count == 0 {
+        return Err(error_response(StatusCode::NOT_FOUND, "menu.unavailable", "Menu item not found"));
+    }
+    Ok(data_response(Bson::Document(doc! { "ok": true })))
+}
+
+async fn reports(State(db): State<Database>, headers: HeaderMap, Query(query): Query<ReportQuery>) -> ApiResult{
+    let claims = require_role(&headers, &["restaurant"])?;
     let range = query.range.unwrap_or_else(|| "30d".to_string());
     let now_millis = now_millis();
     let duration_days = match range.as_str() {
@@ -345,9 +460,8 @@ async fn reports(State(db): State<Database>, Query(query): Query<ReportQuery>) -
     let start_millis = now_millis - (duration_days as i64 * 24 * 60 * 60 * 1000);
 
     let mut filter = Document::new();
-    if let Some(restaurant_id) = query.restaurantId {
-        filter.insert("restaurantId", restaurant_id);
-    }
+    let restaurant_id = query.restaurantId.unwrap_or_else(|| claims.sub.clone());
+    filter.insert("restaurantId", restaurant_id);
 
     let collection = db.collection::<Document>("orders");
     let mut cursor = collection.find(filter)
@@ -414,7 +528,7 @@ pub fn restaurant_router(db: Database) -> Router{
         .route("/orders/{id}", get(get_order))
         .route("/orders/{id}/status", patch(update_order_status))
         .route("/menu", get(list_menu).post(create_menu_item))
-        .route("/menu/{id}", patch(update_menu_item))
+        .route("/menu/{id}", patch(update_menu_item).delete(delete_menu_item))
         .route("/reports", get(reports))
         .with_state(db)
 }

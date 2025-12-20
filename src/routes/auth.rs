@@ -1,10 +1,10 @@
 use axum::{Router, extract::State, routing::post, Json};
 use axum::http::StatusCode;
 use bcrypt::{hash, verify, DEFAULT_COST};
-use mongodb::{bson::{doc, Bson, Document}, Database};
+use mongodb::{bson::{doc, Bson, Document, oid::ObjectId}, Database};
 use serde::Deserialize;
 
-use crate::routes::common::{ApiResult, data_response, data_response_with_status, document_id, error_response};
+use crate::routes::common::{ApiResult, data_response, data_response_with_status, document_id, error_response, sign_token, get_string};
 
 #[derive(Deserialize)]
 struct RegisterRequest {
@@ -33,7 +33,9 @@ async fn register(State(db): State<Database>, Json(payload): Json<RegisterReques
     let password_hash = hash(&payload.password, DEFAULT_COST)
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
 
+    let user_id = ObjectId::new().to_hex();
     let user_doc = doc! {
+        "id": &user_id,
         "name": &payload.name,
         "email": &payload.email,
         "password": password_hash,
@@ -45,13 +47,20 @@ async fn register(State(db): State<Database>, Json(payload): Json<RegisterReques
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
 
-    let id = insert.inserted_id.as_object_id().map(|oid| oid.to_hex());
+    let id = insert.inserted_id.as_object_id().map(|oid| oid.to_hex()).unwrap_or(user_id);
+    let token = sign_token(&id, &payload.email, "customer", None, 24)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
 
     let data = doc! {
-        "id": id.unwrap_or_default(),
-        "email": payload.email,
-        "role": "customer",
-        "phone": payload.phone
+        "token": token,
+        "user": {
+            "id": &id,
+            "email": &payload.email,
+            "role": "customer",
+            "phone": &payload.phone,
+            "name": &payload.name,
+        },
+        "restaurantId": ""
     };
 
     Ok(data_response_with_status(StatusCode::CREATED, Bson::Document(data)))
@@ -75,13 +84,25 @@ async fn login(State(db): State<Database>, Json(payload): Json<LoginRequest>) ->
         return Err(error_response(StatusCode::UNAUTHORIZED, "auth.invalid", "invalid credentials"));
     }
 
-    let token = mongodb::bson::oid::ObjectId::new().to_hex();
     let user_id = document_id(&user_doc).unwrap_or_default();
+    let role = user_doc.get_str("role").unwrap_or("customer");
+    let restaurant_id = if role.eq_ignore_ascii_case("restaurant") {
+        get_string(&user_doc, "restaurantId")
+            .or_else(|| get_string(&user_doc, "shop_id"))
+            .or_else(|| Some(user_id.clone()))
+    } else {
+        None
+    };
+
+    let token = sign_token(&user_id, &payload.email, role, restaurant_id.as_deref(), 24)
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
     let user_data = doc! {
         "id": user_id,
         "email": payload.email,
-        "role": user_doc.get_str("role").unwrap_or("customer"),
-        "phone": user_doc.get_str("phone").unwrap_or("")
+        "role": role,
+        "phone": user_doc.get_str("phone").unwrap_or(""),
+        "name": user_doc.get_str("name").unwrap_or(""),
+        "restaurantId": restaurant_id.clone().unwrap_or_default()
     };
 
     let data = doc! { "token": token, "user": Bson::Document(user_data) };

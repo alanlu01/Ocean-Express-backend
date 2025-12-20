@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 use axum::Router;
 use mongodb::Database;
 

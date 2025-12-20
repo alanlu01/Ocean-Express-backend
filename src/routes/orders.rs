@@ -5,7 +5,10 @@ use futures::stream::TryStreamExt;
 use futures::stream;
 use axum::http::StatusCode;
 use std::convert::Infallible;
-use crate::routes::common::{ApiResult, data_response, data_response_with_status, error_response, document_id, get_string, get_i64, now_datetime, iso_from_bson, bearer_token};
+use crate::routes::common::{ApiResult, data_response, data_response_with_status, error_response, document_id, get_string, get_i64, get_f64, now_datetime, iso_from_bson, require_role, haversine_km};
+
+const PREP_MINUTES: i64 = 10;
+const WALK_SPEED_KMH: f64 = 5.0;
 
 #[derive(Deserialize)]
 struct DeliveryLocation {
@@ -16,22 +19,29 @@ struct DeliveryLocation {
 
 #[derive(Deserialize)]
 struct OrderItemRequest {
-    menuItemId: String,
+    #[serde(rename = "menuItemId")]
+    menu_item_id: String,
     quantity: Option<i64>,
     size: Option<String>,
     spiciness: Option<String>,
-    addDrink: Option<bool>,
+    #[serde(rename = "addDrink")]
+    add_drink: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct CreateOrderRequest {
-    restaurantId: Option<String>,
-    deliveryLocation: DeliveryLocation,
+    #[serde(rename = "restaurantId")]
+    restaurant_id: Option<String>,
+    #[serde(rename = "deliveryLocation")]
+    delivery_location: DeliveryLocation,
     items: Vec<OrderItemRequest>,
-    deliveryFee: i64,
-    totalAmount: i64,
+    #[serde(rename = "deliveryFee")]
+    delivery_fee: i64,
+    #[serde(rename = "totalAmount")]
+    total_amount: i64,
     notes: Option<String>,
-    requestedTime: Option<String>,
+    #[serde(rename = "requestedTime")]
+    requested_time: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +53,26 @@ struct RatingRequest {
 #[derive(Deserialize)]
 struct OrderListQuery {
     status: Option<String>,
+}
+
+async fn load_customer(db: &Database, user_id: &str) -> Option<Document>{
+    let users = db.collection::<Document>("users");
+    match users.find_one(doc! { "id": user_id }).await {
+        Ok(Some(user_doc)) => {
+            let mut c = Document::new();
+            if let Some(name) = get_string(&user_doc, "name") {
+                c.insert("name", name);
+            }
+            if let Some(phone) = get_string(&user_doc, "phone") {
+                c.insert("phone", phone);
+            }
+            if let Some(email) = get_string(&user_doc, "email") {
+                c.insert("email", email);
+            }
+            Some(c)
+        }
+        _ => None,
+    }
 }
 
 async fn find_menu_item(db: &Database, menu_item_id: &str) -> Result<Option<Document>, (StatusCode, Json<Document>)>{
@@ -59,16 +89,18 @@ async fn find_menu_item(db: &Database, menu_item_id: &str) -> Result<Option<Docu
 }
 
 async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(payload): Json<CreateOrderRequest>) -> ApiResult{
+    let claims = require_role(&headers, &["customer"])?;
     if payload.items.is_empty() {
         return Err(error_response(StatusCode::BAD_REQUEST, "validation.failed", "Order items required"));
     }
 
     let mut items: Vec<Bson> = Vec::new();
-    let mut restaurant_id: Option<String> = payload.restaurantId.clone();
+    let mut restaurant_id: Option<String> = payload.restaurant_id.clone();
     let mut restaurant_name: Option<String> = None;
+    let mut restaurant_latlng: Option<(f64, f64)> = None;
 
     for item in &payload.items {
-        let menu_doc = find_menu_item(&db, &item.menuItemId).await?;
+        let menu_doc = find_menu_item(&db, &item.menu_item_id).await?;
         let Some(menu_doc) = menu_doc else {
             return Err(error_response(StatusCode::BAD_REQUEST, "menu.unavailable", "menu item unavailable"));
         };
@@ -84,17 +116,23 @@ async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(paylo
                 .or_else(|| get_string(&menu_doc, "restaurant_id"));
         }
 
-        let price = get_i64(&menu_doc, "price").unwrap_or(0);
+        let price = get_i64(&menu_doc, "price").unwrap_or_else(|| {
+            menu_doc.get("price").and_then(Bson::as_f64).map(|v| v.round() as i64).unwrap_or(0)
+        });
         let quantity = item.quantity.unwrap_or(1);
         let mut item_doc = Document::new();
-        item_doc.insert("menuItemId", &item.menuItemId);
+        item_doc.insert("menuItemId", &item.menu_item_id);
         item_doc.insert("name", get_string(&menu_doc, "name").unwrap_or_default());
         item_doc.insert("size", item.size.clone().unwrap_or_default());
         item_doc.insert("spiciness", item.spiciness.clone().unwrap_or_default());
-        item_doc.insert("addDrink", item.addDrink.unwrap_or(false));
+        item_doc.insert("addDrink", item.add_drink.unwrap_or(false));
         item_doc.insert("quantity", quantity);
         item_doc.insert("price", price);
         items.push(Bson::Document(item_doc));
+    }
+
+    if restaurant_id.is_none() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "validation.failed", "restaurantId required"));
     }
 
     if let Some(rest_id) = restaurant_id.as_deref() {
@@ -102,16 +140,30 @@ async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(paylo
         if let Some(rest) = collection.find_one(doc! { "id": rest_id }).await
             .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
             restaurant_name = get_string(&rest, "name");
+            if let (Some(lat), Some(lng)) = (get_f64(&rest, "lat"), get_f64(&rest, "lng")) {
+                restaurant_latlng = Some((lat, lng));
+            }
         }
     }
 
-    let mut location_doc = doc! { "name": &payload.deliveryLocation.name };
-    if let Some(lat) = payload.deliveryLocation.lat {
+    let mut location_doc = doc! { "name": &payload.delivery_location.name };
+    if let Some(lat) = payload.delivery_location.lat {
         location_doc.insert("lat", lat);
     }
-    if let Some(lng) = payload.deliveryLocation.lng {
+    if let Some(lng) = payload.delivery_location.lng {
         location_doc.insert("lng", lng);
     }
+
+    let distance_km = match (restaurant_latlng, payload.delivery_location.lat, payload.delivery_location.lng) {
+        (Some((r_lat, r_lng)), Some(d_lat), Some(d_lng)) => haversine_km(r_lat, r_lng, d_lat, d_lng),
+        _ => 0.0,
+    };
+    let travel_minutes = if distance_km > 0.0 {
+        ((distance_km / WALK_SPEED_KMH) * 60.0).ceil() as i64
+    } else {
+        15
+    };
+    let eta_minutes = PREP_MINUTES + travel_minutes;
 
     let now = now_datetime();
     let status = "available";
@@ -122,24 +174,31 @@ async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(paylo
 
     let order_id = mongodb::bson::oid::ObjectId::new().to_hex();
     let code = order_id.chars().take(6).collect::<String>().to_uppercase();
-    let user_id = bearer_token(&headers).unwrap_or_default();
+    let customer_info = load_customer(&db, &claims.sub).await.unwrap_or_else(|| {
+        let mut d = Document::new();
+        d.insert("id", &claims.sub);
+        d
+    });
+
     let order_doc = doc! {
         "id": &order_id,
         "code": &code,
-        "userId": user_id,
+        "userId": &claims.sub,
+        "customer": customer_info,
         "deliveryLocation": location_doc,
         "items": items,
-        "deliveryFee": payload.deliveryFee,
-        "totalAmount": payload.totalAmount,
+        "deliveryFee": payload.delivery_fee,
+        "totalAmount": payload.total_amount,
         "status": status,
         "statusHistory": status_history,
         "notes": payload.notes,
         "restaurantId": restaurant_id.unwrap_or_default(),
         "restaurantName": restaurant_name.unwrap_or_default(),
-        "requestedTime": payload.requestedTime,
+        "requestedTime": payload.requested_time,
         "placedAt": now,
         "createdAt": now,
-        "etaMinutes": 20
+        "etaMinutes": eta_minutes,
+        "distanceKm": (distance_km.round() as i64)
     };
 
     let orders = db.collection::<Document>("orders");
@@ -150,11 +209,12 @@ async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(paylo
     Ok(data_response_with_status(StatusCode::CREATED, Bson::Document(doc! {
         "id": order_id,
         "status": status,
-        "etaMinutes": 20
+        "etaMinutes": eta_minutes
     })))
 }
 
 async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQuery>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["customer"])?;
     let statuses = match query.status.as_deref() {
         Some("history") => vec!["delivered", "cancelled"],
         Some("active") => vec!["available", "assigned", "en_route_to_pickup", "picked_up", "delivering"],
@@ -165,9 +225,7 @@ async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQu
     if !statuses.is_empty() {
         filter.insert("status", doc! { "$in": statuses });
     }
-    if let Some(user_id) = bearer_token(&headers) {
-        filter.insert("userId", user_id);
-    }
+    filter.insert("userId", &claims.sub);
 
     let collection = db.collection::<Document>("orders");
     let mut cursor = collection.find(filter)
@@ -187,6 +245,18 @@ async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQu
         if let Some(placed_at) = doc.get("placedAt").and_then(iso_from_bson) {
             item.insert("placedAt", placed_at);
         }
+        if let Some(rating) = doc.get("rating") {
+            item.insert("rating", rating.clone());
+        }
+        if let Some(customer) = doc.get("customer") {
+            item.insert("customer", customer.clone());
+        } else {
+            if let Some(user_id) = get_string(&doc, "userId") {
+                if let Some(c) = load_customer(&db, &user_id).await {
+                    item.insert("customer", c);
+                }
+            }
+        }
         orders.push(Bson::Document(item));
     }
 
@@ -194,6 +264,7 @@ async fn list_orders(State(db): State<Database>, Query(query): Query<OrderListQu
 }
 
 async fn get_order(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["customer"])?;
     let collection = db.collection::<Document>("orders");
     let filter = doc! { "id": &id };
     let order = collection.find_one(filter)
@@ -225,11 +296,16 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>, headers: 
     if let Some(notes) = get_string(&order_doc, "notes") {
         data.insert("notes", notes);
     }
-    if let Some(user_id) = bearer_token(&headers) {
-        if let Some(order_user_id) = get_string(&order_doc, "userId") {
-            if order_user_id != user_id {
-                return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
-            }
+    if let Some(customer) = order_doc.get("customer") {
+        data.insert("customer", customer.clone());
+    } else if let Some(uid) = get_string(&order_doc, "userId") {
+        if let Some(c) = load_customer(&db, &uid).await {
+            data.insert("customer", c);
+        }
+    }
+    if let Some(order_user_id) = get_string(&order_doc, "userId") {
+        if order_user_id != claims.sub {
+            return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
         }
     }
 
@@ -275,8 +351,25 @@ async fn get_order(Path(id): Path<String>, State(db): State<Database>, headers: 
     Ok(data_response(Bson::Document(data)))
 }
 
-async fn add_rating(Path(id): Path<String>, State(db): State<Database>, Json(payload): Json<RatingRequest>) -> ApiResult{
+async fn add_rating(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<RatingRequest>) -> ApiResult{
+    let claims = require_role(&headers, &["customer"])?;
+    if payload.score < 1 || payload.score > 5 {
+        return Err(error_response(StatusCode::BAD_REQUEST, "validation.failed", "score must be 1-5"));
+    }
     let collection = db.collection::<Document>("orders");
+    let existing = collection.find_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(order_doc) = existing else {
+        return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
+    };
+    if get_string(&order_doc, "userId").as_deref() != Some(&claims.sub) {
+        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
+    if get_string(&order_doc, "status").as_deref() != Some("delivered") {
+        return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "order not delivered"));
+    }
+
     let rating_doc = doc! {
         "score": payload.score,
         "comment": payload.comment.clone()
@@ -296,9 +389,25 @@ async fn add_rating(Path(id): Path<String>, State(db): State<Database>, Json(pay
     })))
 }
 
-async fn cancel_order(Path(id): Path<String>, State(db): State<Database>) -> ApiResult{
+async fn cancel_order(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap) -> ApiResult{
+    let claims = require_role(&headers, &["customer"])?;
     let collection = db.collection::<Document>("orders");
     let now = now_datetime();
+    let existing = collection.find_one(doc! { "id": &id })
+        .await
+        .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
+    let Some(order_doc) = existing else {
+        return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
+    };
+    if get_string(&order_doc, "userId").as_deref() != Some(&claims.sub) {
+        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
+    let status = get_string(&order_doc, "status").unwrap_or_default();
+    let cancellable = matches!(status.as_str(), "available" | "assigned" | "en_route_to_pickup");
+    if !cancellable {
+        return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "order cannot be cancelled"));
+    }
+
     let update = doc! {
         "$set": { "status": "cancelled" },
         "$push": { "statusHistory": { "status": "cancelled", "timestamp": now } }
@@ -315,7 +424,7 @@ async fn cancel_order(Path(id): Path<String>, State(db): State<Database>) -> Api
 }
 
 async fn stream_orders(headers: HeaderMap) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>>{
-    let _ = bearer_token(&headers);
+    let _ = require_role(&headers, &["customer", "restaurant", "deliverer"]);
     let event = Event::default().event("order.updated").data("{}");
     Sse::new(stream::once(async move { Ok(event) }))
 }
