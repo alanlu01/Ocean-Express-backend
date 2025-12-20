@@ -93,9 +93,9 @@ fn map_delivery(order: &Document) -> Document{
 }
 
 async fn list_available(State(db): State<Database>, headers: HeaderMap) -> ApiResult{
-    let _claims = require_role(&headers, &["deliverer", "customer"])?;
+    let claims = require_role(&headers, &["deliverer", "customer"])?;
     let collection = db.collection::<Document>("orders");
-    let filter = doc! { "status": "available" };
+    let filter = doc! { "status": "available", "userId": { "$ne": &claims.sub } };
     let mut cursor = collection.find(filter)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?;
@@ -119,6 +119,9 @@ async fn get_delivery(Path(id): Path<String>, State(db): State<Database>, header
     let Some(order_doc) = order else {
         return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
     };
+    if get_string(&order_doc, "userId").as_deref() == Some(&claims.sub) {
+        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
     if get_string(&order_doc, "status").as_deref() != Some("available") {
         if get_string(&order_doc, "delivererId").as_deref() != Some(&claims.sub) {
             return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
@@ -137,16 +140,35 @@ async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, hea
     let Some(order_doc) = order else {
         return Err(error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"));
     };
+    if get_string(&order_doc, "userId").as_deref() == Some(&claims.sub) {
+        return Err(error_response(StatusCode::FORBIDDEN, "auth.forbidden", "forbidden"));
+    }
     if get_string(&order_doc, "status").as_deref() != Some("available") {
         return Err(error_response(StatusCode::BAD_REQUEST, "order.conflict", "order not available"));
     }
+
+    // fallback rider info from users collection if not provided
+    let mut rider_name = payload.rider_name.unwrap_or_default();
+    let mut rider_phone = payload.rider_phone.unwrap_or_default();
+    if rider_name.is_empty() || rider_phone.is_empty() {
+        let users_coll = db.collection::<Document>("users");
+        if let Ok(Some(user_doc)) = users_coll.find_one(doc! { "id": &claims.sub }).await {
+            if rider_name.is_empty() {
+                rider_name = get_string(&user_doc, "name").unwrap_or_default();
+            }
+            if rider_phone.is_empty() {
+                rider_phone = get_string(&user_doc, "phone").unwrap_or_default();
+            }
+        }
+    }
+
     let now = now_datetime();
     let update = doc! {
         "$set": {
             "status": "assigned",
             "delivererId": &claims.sub,
-            "riderName": payload.rider_name.unwrap_or_default(),
-            "riderPhone": payload.rider_phone.unwrap_or_default()
+            "riderName": rider_name,
+            "riderPhone": rider_phone
         },
         "$push": { "statusHistory": { "status": "assigned", "timestamp": now } }
     };
@@ -168,6 +190,7 @@ async fn list_active(State(db): State<Database>, headers: HeaderMap) -> ApiResul
     let collection = db.collection::<Document>("orders");
     let filter = doc! {
         "delivererId": &claims.sub,
+        "userId": { "$ne": &claims.sub },
         "status": { "$in": ["assigned", "en_route_to_pickup", "picked_up", "delivering"] }
     };
     let mut cursor = collection.find(filter)
@@ -187,6 +210,7 @@ async fn list_history(State(db): State<Database>, headers: HeaderMap, Query(quer
     let collection = db.collection::<Document>("orders");
     let mut filter = doc! {
         "delivererId": &claims.sub,
+        "userId": { "$ne": &claims.sub },
         "status": { "$in": ["delivered", "cancelled"] }
     };
     if let Some((start, end)) = date_range_to_bson(query.from.as_deref(), query.to.as_deref()) {
