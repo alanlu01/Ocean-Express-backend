@@ -3,7 +3,7 @@ use mongodb::{bson::{doc, Bson, Document}, Database};
 use serde::Deserialize;
 use futures::stream::TryStreamExt;
 use axum::http::StatusCode;
-use crate::routes::common::{ApiResult, data_response, error_response, document_id, get_i64, now_datetime, get_string, date_range_to_bson, iso_from_bson, require_role};
+use crate::routes::common::{ApiResult, data_response, error_response, document_id, get_i64, now_datetime, get_string, get_f64, date_range_to_bson, iso_from_bson, require_role};
 
 #[derive(Deserialize)]
 struct AcceptRequest {
@@ -61,7 +61,7 @@ fn can_transition(current: &str, next: &str) -> bool{
     }
 }
 
-fn map_delivery(order: &Document) -> Document{
+async fn map_delivery(db: &Database, order: &Document) -> Result<Document, (StatusCode, Json<Document>)>{
     let mut delivery = Document::new();
     delivery.insert("id", document_id(order).unwrap_or_default());
     delivery.insert("code", get_string(order, "code").unwrap_or_default());
@@ -76,12 +76,30 @@ fn map_delivery(order: &Document) -> Document{
         delivery.insert("dropoff", location.clone());
     }
 
-    let merchant = if let Some(merchant) = order.get("merchant") {
-        merchant.clone()
-    } else {
-        Bson::Document(doc! { "name": get_string(order, "restaurantName").unwrap_or_default() })
-    };
-    delivery.insert("merchant", merchant);
+    // build merchant info with lat/lng fallback from shops
+    let mut merchant_doc = order.get("merchant").and_then(Bson::as_document).cloned().unwrap_or_default();
+    if !merchant_doc.contains_key("name") {
+        merchant_doc.insert("name", Bson::String(get_string(order, "restaurantName").unwrap_or_default()));
+    }
+    let has_lat = merchant_doc.get("lat").and_then(Bson::as_f64).is_some();
+    let has_lng = merchant_doc.get("lng").and_then(Bson::as_f64).is_some();
+    if !(has_lat && has_lng) {
+        if let Some(rest_id) = get_string(order, "restaurantId") {
+            let shops = db.collection::<Document>("shops");
+            if let Ok(Some(shop)) = shops.find_one(doc! { "id": rest_id }).await {
+                if let Some(lat) = get_f64(&shop, "lat") {
+                    merchant_doc.insert("lat", Bson::Double(lat));
+                }
+                if let Some(lng) = get_f64(&shop, "lng") {
+                    merchant_doc.insert("lng", Bson::Double(lng));
+                }
+                if let Some(name) = get_string(&shop, "name") {
+                    merchant_doc.entry("name".to_string()).or_insert(Bson::String(name));
+                }
+            }
+        }
+    }
+    delivery.insert("merchant", Bson::Document(merchant_doc));
 
     if let Some(customer) = order.get("customer") {
         delivery.insert("customer", customer.clone());
@@ -89,7 +107,7 @@ fn map_delivery(order: &Document) -> Document{
         delivery.insert("customer", Bson::Document(doc! { "name": Bson::Null, "phone": Bson::Null }));
     }
 
-    delivery
+    Ok(delivery)
 }
 
 async fn list_available(State(db): State<Database>, headers: HeaderMap) -> ApiResult{
@@ -104,7 +122,7 @@ async fn list_available(State(db): State<Database>, headers: HeaderMap) -> ApiRe
     while let Some(doc) = cursor.try_next()
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
-        deliveries.push(Bson::Document(map_delivery(&doc)));
+        deliveries.push(Bson::Document(map_delivery(&db, &doc).await?));
     }
 
     Ok(data_response(Bson::Array(deliveries)))
@@ -128,7 +146,7 @@ async fn get_delivery(Path(id): Path<String>, State(db): State<Database>, header
         }
     }
 
-    Ok(data_response(Bson::Document(map_delivery(&order_doc))))
+    Ok(data_response(Bson::Document(map_delivery(&db, &order_doc).await?)))
 }
 
 async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<AcceptRequest>) -> ApiResult{
@@ -182,7 +200,7 @@ async fn accept_delivery(Path(id): Path<String>, State(db): State<Database>, hea
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"))?;
-    Ok(data_response(Bson::Document(map_delivery(&updated))))
+    Ok(data_response(Bson::Document(map_delivery(&db, &updated).await?)))
 }
 
 async fn list_active(State(db): State<Database>, headers: HeaderMap) -> ApiResult{
@@ -200,7 +218,7 @@ async fn list_active(State(db): State<Database>, headers: HeaderMap) -> ApiResul
     while let Some(doc) = cursor.try_next()
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
-        deliveries.push(Bson::Document(map_delivery(&doc)));
+        deliveries.push(Bson::Document(map_delivery(&db, &doc).await?));
     }
     Ok(data_response(Bson::Array(deliveries)))
 }
@@ -223,7 +241,7 @@ async fn list_history(State(db): State<Database>, headers: HeaderMap, Query(quer
     while let Some(doc) = cursor.try_next()
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))? {
-        deliveries.push(Bson::Document(map_delivery(&doc)));
+        deliveries.push(Bson::Document(map_delivery(&db, &doc).await?));
     }
     Ok(data_response(Bson::Array(deliveries)))
 }
@@ -259,7 +277,7 @@ async fn update_status(Path(id): Path<String>, State(db): State<Database>, heade
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, "server.error", &e.to_string()))?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "order.not_found", "Order not found"))?;
-    Ok(data_response(Bson::Document(map_delivery(&updated))))
+    Ok(data_response(Bson::Document(map_delivery(&db, &updated).await?)))
 }
 
 async fn report_incident(Path(id): Path<String>, State(db): State<Database>, headers: HeaderMap, Json(payload): Json<IncidentRequest>) -> ApiResult{
