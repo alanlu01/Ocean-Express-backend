@@ -192,12 +192,19 @@ async fn create_order(State(db): State<Database>, headers: HeaderMap, Json(paylo
         d.insert("id", &claims.sub);
         d
     });
+    let mut merchant_info = Document::new();
+    merchant_info.insert("name", restaurant_name.clone().unwrap_or_default());
+    if let Some((lat, lng)) = restaurant_latlng {
+        merchant_info.insert("lat", lat);
+        merchant_info.insert("lng", lng);
+    }
 
     let order_doc = doc! {
         "id": &order_id,
         "code": &code,
         "userId": &claims.sub,
         "customer": customer_info,
+        "merchant": merchant_info,
         "deliveryLocation": location_doc,
         "items": items,
         "deliveryFee": payload.delivery_fee,
